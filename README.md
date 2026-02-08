@@ -151,3 +151,8 @@ Please take a look at [xmit.co](https://xmit.co).
 ## Donations
 
 Please donate through [ko-fi](https://ko-fi.com/pcarrier/tip) or [GitHub](https://github.com/sponsors/pcarrier).
+
+## Development
+
+- [Backend Development Guide](docs/backend-running.md)
+- [后端开发指南](docs/backend-running.zh-CN.md)
