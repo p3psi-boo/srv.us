@@ -757,7 +757,7 @@ func endpointURLs(user string, key *ssh.PublicKey, port uint32, githubEnabled bo
 	_, _ = hasher.Write((*key).Marshal())
 	_, _ = hasher.Write([]byte{0})
 	_, _ = hasher.Write([]byte(strconv.Itoa(int(port))))
-	b32 := b32encoder.EncodeToString(hasher.Sum(nil)[:16])
+	b32 := b32encoder.EncodeToString(hasher.Sum(nil)[:5])
 	result := []string{fmt.Sprintf("%s.%s", b32, *domain)}
 	lower := strings.ToLower(user)
 	if githubEnabled {
