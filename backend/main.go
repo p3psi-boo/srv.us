@@ -7,6 +7,7 @@ import (
 	"crypto/sha1"
 	"crypto/sha256"
 	"crypto/tls"
+	"database/sql"
 	"encoding/base32"
 	"encoding/base64"
 	"errors"
@@ -28,8 +29,8 @@ import (
 	"github.com/likexian/doh"
 	"github.com/likexian/doh/dns"
 
-	"github.com/jackc/pgx/v4/pgxpool"
 	"golang.org/x/crypto/ssh"
+	_ "modernc.org/sqlite"
 )
 
 var (
@@ -43,7 +44,8 @@ var (
 	sshHostKeysPath  = flag.String("ssh-host-keys-path", "/etc/ssh", "Path where ssh_host_ecdsa_key, ssh_host_ed25519_key, ssh_host_rsa_key can be found")
 	githubSubdomains = flag.Bool("github-subdomains", true, "Whether to expose $username.gh subdomains")
 	gitlabSubdomains = flag.Bool("gitlab-subdomains", true, "Whether to expose $username.gl subdomains")
-	pgConn           = flag.String("pg-conn", "", "Postgres connection string")
+	sqlitePath       = flag.String("sqlite-path", "./srvus.sqlite3", "SQLite database file path")
+	sqliteHighPerf   = flag.Bool("sqlite-high-perf", true, "Enable SQLite performance-oriented pragmas")
 )
 
 type remoteForwardRequest struct {
@@ -90,15 +92,15 @@ type server struct {
 	sync.Mutex
 	conns     map[*ssh.ServerConn]*sshConnection
 	endpoints map[string]map[*target]void
-	pool      *pgxpool.Pool
+	db        *sql.DB
 	dns       *doh.DoH
 }
 
-func newServer(pool *pgxpool.Pool) *server {
+func newServer(db *sql.DB) *server {
 	return &server{
 		conns:     map[*ssh.ServerConn]*sshConnection{},
 		endpoints: map[string]map[*target]void{},
-		pool:      pool,
+		db:        db,
 		dns:       doh.Use(doh.GoogleProvider, doh.CloudflareProvider),
 	}
 }
@@ -417,19 +419,16 @@ func (s *server) serveRoot(https *tls.Conn) error {
 		if err != nil {
 			_, _ = https.Write([]byte(fmt.Sprintf("HTTP/1.1 400 Bad Request\r\n\r\nFailed to read request body: %v", err)))
 			return fmt.Errorf("could not read request body: %w",
-			err)
+				err)
 		}
 		hash := sha1.Sum(content)
 		code := b32encoder.EncodeToString(hash[:])
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		rows, err := s.pool.Query(ctx, "INSERT INTO pastes(code, content) VALUES ($1, $2) ON CONFLICT DO NOTHING", code, content)
+		_, err = s.db.ExecContext(ctx, "INSERT OR IGNORE INTO pastes(code, content) VALUES (?, ?)", code, content)
 		if err != nil {
 			_, _ = https.Write([]byte(fmt.Sprintf("HTTP/1.1 500 Internal Server Error\r\n\r\nFailed to store paste: %v", err)))
 			return fmt.Errorf("could not store paste: %w", err)
-		}
-		if rows != nil {
-			rows.Close()
 		}
 		_, _ = https.Write([]byte(fmt.Sprintf("HTTP/1.1 200 OK\r\n\r\nhttps://%s/%s\r\n", *domain, code)))
 	} else if req.URL.Path == "/" {
@@ -438,25 +437,17 @@ func (s *server) serveRoot(https *tls.Conn) error {
 		code := req.URL.Path[1:]
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		res, err := s.pool.Query(ctx, "SELECT content FROM pastes WHERE code = $1", code)
+		var content []byte
+		err = s.db.QueryRowContext(ctx, "SELECT content FROM pastes WHERE code = ?", code).Scan(&content)
 		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				_, _ = https.Write([]byte("HTTP/1.1 404 Not Found\r\n\r\n"))
+				return nil
+			}
 			_, _ = https.Write([]byte(fmt.Sprintf("HTTP/1.1 500 Internal Server Error\r\n\r\nDatabase error: %v", err)))
 			return fmt.Errorf("could not query paste: %w", err)
 		}
-		if res != nil {
-			defer res.Close()
-			if res.Next() {
-				cols, err := res.Values()
-				if err != nil {
-					_, _ = https.Write([]byte("HTTP/1.1 404 Not Found\r\n\r\n"))
-					return fmt.Errorf("could not read paste: %w", err)
-				}
-				content := cols[0].([]byte)
-				_, _ = https.Write([]byte(fmt.Sprintf("HTTP/1.1 200 OK\r\n\r\n%s", content)))
-			} else {
-				_, _ = https.Write([]byte("HTTP/1.1 404 Not Found\r\n\r\n"))
-			}
-		}
+		_, _ = https.Write([]byte(fmt.Sprintf("HTTP/1.1 200 OK\r\n\r\n%s", content)))
 	}
 	return nil
 }
@@ -800,17 +791,60 @@ func addKey(sshConfig *ssh.ServerConfig, path string) {
 	sshConfig.AddHostKey(private)
 }
 
+func initDB(path string) (*sql.DB, error) {
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		return nil, fmt.Errorf("open sqlite: %w", err)
+	}
+
+	if err := db.Ping(); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("connect sqlite: %w", err)
+	}
+
+	db.SetMaxOpenConns(1)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	pragmas := []string{
+		"PRAGMA journal_mode=WAL;",
+		"PRAGMA busy_timeout=5000;",
+	}
+	if *sqliteHighPerf {
+		pragmas = append(pragmas,
+			"PRAGMA synchronous=NORMAL;",
+			"PRAGMA temp_store=MEMORY;",
+			"PRAGMA cache_size=-65536;",
+			"PRAGMA mmap_size=268435456;",
+		)
+	}
+
+	for _, pragma := range pragmas {
+		if _, err := db.ExecContext(ctx, pragma); err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("apply sqlite pragma %q: %w", pragma, err)
+		}
+	}
+	if _, err := db.ExecContext(ctx, "CREATE TABLE IF NOT EXISTS pastes (code TEXT PRIMARY KEY, content BLOB NOT NULL);"); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("create pastes table: %w", err)
+	}
+
+	return db, nil
+}
+
 func main() {
 	flag.Parse()
 	rand.Seed(time.Now().UnixNano())
 
-	pool, err := pgxpool.Connect(context.Background(), *pgConn)
+	db, err := initDB(*sqlitePath)
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer pool.Close()
+	defer db.Close()
 
-	s := newServer(pool)
+	s := newServer(db)
 	go s.logStats()
 	go s.serveHTTPS()
 	s.serveSSH()
